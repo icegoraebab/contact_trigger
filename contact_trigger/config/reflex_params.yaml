@@ -1,34 +1,27 @@
 reflex_grasp_node:
   ros__parameters:
 
-    # ── SNN 접촉 감지 ────────────────────────────────────────────────────────
-    # LIF 정상상태 막전위 = Σ|Δθ| × tau
-    # 손가락 5° 움직임 ≈ Σ|Δθ| = 0.35 rad
-    # V_ss = 0.35 × 0.05 = 0.0175
-    # → threshold 는 V_ss 보다 낮아야 발화 가능
-    contact_threshold: 0.01    # (기존 1.0 → 수정. 0.35rad 입력 시 약 0.3s 후 발화)
-
-    # LIF 시상수 [s]: 클수록 자극이 오래 누적됨
-    snn_tau_contact: 0.05
-
-    # 최소 발화 손가락 수 (1 = 하나만 닿아도 grasp)
-    min_finger_triggers: 1
+    # ── 접촉 감지 (단순 임계값 비교) ────────────────────────────────────────
+    # 손가락 살짝 건드림 ≈ Σ|Δθ| 0.05 rad 이상
+    contact_delta_threshold: 0.05   # [rad] 이 값 넘으면 grasp 트리거
+    min_finger_triggers: 1          # 몇 개 손가락 이상 감지 시 트리거
 
     # ── SNN Slip 감지 ────────────────────────────────────────────────────────
-    # slip LIF 정상상태 = position_error × tau_slip
-    # 0.05rad slip × 0.03 = 0.0015 → threshold 이보다 낮게
-    slip_threshold: 0.001
+    # slip = cmd_MCP - cur_MCP (목표보다 실제가 열려있는 정도)
+    # LIF 뉴런이 이 값을 적분 → threshold 초과 → spike → target 증가
+    slip_threshold:  0.001          # LIF 발화 임계치
+    snn_tau_slip:    0.03           # slip SNN 시상수 [s]
 
-    # slip SNN 시상수 [s]
-    snn_tau_slip: 0.03
+    # ── Slip 보상 ────────────────────────────────────────────────────────────
+    slip_target_increment: 0.05     # spike 시 목표각 증가량 [rad]
+    slip_target_max:       1.57     # 목표각 상한 [rad] (90도)
+
+    # ── 닫기 속도 ────────────────────────────────────────────────────────────
+    grasp_speed: 0.3                # [rad/s]
 
     # ── 물체 크기 적응 ───────────────────────────────────────────────────────
-    object_contact_vel_threshold: 0.005
+    object_contact_vel_threshold: 0.008   # [rad/s] 이하면 물체 접촉 판정
 
-    # ── 천천히 닫기 속도 ─────────────────────────────────────────────────────
-    grasp_speed: 0.7
-    grasp_speed_max: 1.0
-
-    # ── 기타 ─────────────────────────────────────────────────────────────────
-    settle_frames: 300
-    grasp_hold_sec: 0.0
+    # ── 안정화 ───────────────────────────────────────────────────────────────
+    settle_frames:  400             # 100Hz × 4s
+    grasp_hold_sec: 0.0             # 0 = 무한 유지
