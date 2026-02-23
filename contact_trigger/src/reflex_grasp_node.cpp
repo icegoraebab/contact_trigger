@@ -1,29 +1,35 @@
 // =============================================================================
 // reflex_grasp_node.cpp  (contact_trigger 패키지)
 //
-// ── 핵심 흐름 ────────────────────────────────────────────────────────────────
-//  1. SETTLING
-//     → "ready" 발행 → 손 안정화 4초 대기
+// ── 전체 흐름 ────────────────────────────────────────────────────────────────
 //
-//  2. READY_MONITORING
-//     → 현재각을 기준각(ready_pos_)으로 저장
-//     → 100Hz 마다 Σ|Δθ| 계산
-//     → Σ|Δθ| > contact_delta_threshold 인 손가락 수 카운트
-//     → min_finger_triggers 이상이면 → SLOW_GRASPING
-//     (SNN 없음, 단순 임계값 비교)
+//  [SETTLING]
+//    → "ready" 발행
+//    → 손이 ready 포즈로 이동 + 안정화 (4초)
 //
-//  3. SLOW_GRASPING
-//     → "pdControl" 발행
-//     → grasp_3 목표각으로 0.3 rad/s 천천히 보간 닫기
-//     → 손가락이 물체에 닿으면 속도 급감 → 그 위치에서 MCP 홀드
-//     → [SNN 동작 시작]
-//        slip = max(0, cmd_MCP - cur_MCP)  (목표보다 실제가 열려있는 정도)
-//        → LIF 뉴런 적분 → threshold 초과 → spike
-//        → grasp_target MCP/PIP/DIP += slip_target_increment
-//        → fin_contacted 리셋 → 더 깊이 닫기 재시작
-//        → PD 토크 자연히 증가 → 더 세게 잡음
+//  [READY_MONITORING]
+//    → 현재각을 기준각(ready_pos_)으로 저장
+//    → 100Hz 마다 Σ|Δθ| 계산
+//    → Σ|Δθ| > contact_delta_threshold 손가락 수 >= min_finger_triggers
+//    → GRASPING 전이
 //
-//  4. 키보드 'r' → SETTLING 리셋 (grasp_target 도 초기화)
+//  [GRASPING]
+//    → "grasp_3" 발행 (BHand 내장 동작 그대로 사용)
+//    → grasp_3 포즈 완료 대기
+//      (현재각 - grasp_3 목표각 오차 < grasp_reach_threshold)
+//    → 완료되면 SNN_STABILIZING 전이
+//
+//  [SNN_STABILIZING]
+//    → 토크(effort) 감시
+//    → effort > effort_contact_threshold 손가락 수 >= min_effort_fingers
+//      → 물체 부하 확인 → SNN slip 보정 시작
+//    → slip = max(0, grasp_target_MCP - cur_MCP)
+//    → LIF 뉴런 적분 → spike
+//    → grasp_target MCP/PIP/DIP += slip_target_increment
+//    → "pdControl" + joint_cmd 로 더 세게 잡기
+//
+//  [리셋]
+//    → 키보드 'r' → SETTLING
 // =============================================================================
 
 #include "contact_trigger/reflex_grasp_node.hpp"
@@ -35,8 +41,7 @@ namespace contact_trigger
 {
 
 // =============================================================================
-// grasp_3 초기 목표각 [rad]
-// slip 발생 시 MCP/PIP/DIP 가 동적으로 증가
+// grasp_3 실측 목표각 [rad]
 // =============================================================================
 static constexpr double GRASP3[16] = {
     //  spread      MCP        PIP        DIP
@@ -47,7 +52,22 @@ static constexpr double GRASP3[16] = {
         1.40778,   0.06167,  -0.24653,   1.78327    // finger3 (thumb)
 };
 
+// slip 보상 방향 (+1 = 증가, -1 = 감소)
+// thumb PIP 는 음수 방향이 더 닫히는 방향
+static constexpr double SLIP_DIR[N_FIN][4] = {
+    { 0.0,  1.0,  1.0,  1.0 },   // finger0
+    { 0.0,  1.0,  1.0,  1.0 },   // finger1
+    { 0.0,  1.0,  1.0,  1.0 },   // finger2
+    { 0.0,  1.0, -1.0,  1.0 }    // finger3 (thumb PIP 반대)
+};
 
+// slip 보상 한계값
+static constexpr double SLIP_LIMIT[N_FIN][4] = {
+    { 0.0,  1.57,  1.57,  1.57 },
+    { 0.0,  1.57,  1.57,  1.57 },
+    { 0.0,  1.57,  1.57,  1.57 },
+    { 0.0,  1.57, -0.50,  1.57 }   // thumb PIP 하한
+};
 
 // =============================================================================
 // Constructor
@@ -55,42 +75,39 @@ static constexpr double GRASP3[16] = {
 ReflexGraspNode::ReflexGraspNode(const rclcpp::NodeOptions & options)
 : Node("reflex_grasp_node", options)
 {
-    // ── 파라미터 선언 ────────────────────────────────────────────────────────
-    declare_parameter("contact_delta_threshold",      0.05);
-    declare_parameter("min_finger_triggers",          1);
-    declare_parameter("slip_threshold",               0.001);
-    declare_parameter("snn_tau_slip",                 0.03);
-    declare_parameter("slip_target_increment",        0.05);
-    declare_parameter("slip_target_max",              1.57);
-    declare_parameter("grasp_speed",                  0.3);
-    declare_parameter("object_contact_vel_threshold", 0.008);
-    declare_parameter("settle_frames",                400);
-    declare_parameter("grasp_hold_sec",               0.0);
+    declare_parameter("contact_delta_threshold",   0.05);
+    declare_parameter("min_finger_triggers",       1);
+    declare_parameter("grasp_reach_threshold",     0.15);
+    declare_parameter("effort_contact_threshold",  0.3);
+    declare_parameter("min_effort_fingers",        1);
+    declare_parameter("slip_threshold",            0.001);
+    declare_parameter("snn_tau_slip",              0.03);
+    declare_parameter("slip_target_increment",     0.05);
+    declare_parameter("slip_target_max",           1.57);
+    declare_parameter("settle_frames",             400);
+    declare_parameter("grasp_hold_sec",            0.0);
 
-    // ── 파라미터 로드 ────────────────────────────────────────────────────────
-    contact_delta_threshold_      = get_parameter("contact_delta_threshold").as_double();
-    min_finger_triggers_          = get_parameter("min_finger_triggers").as_int();
-    slip_threshold_               = get_parameter("slip_threshold").as_double();
-    snn_tau_slip_                 = get_parameter("snn_tau_slip").as_double();
-    slip_target_increment_        = get_parameter("slip_target_increment").as_double();
-    slip_target_max_              = get_parameter("slip_target_max").as_double();
-    grasp_speed_                  = get_parameter("grasp_speed").as_double();
-    object_contact_vel_threshold_ = get_parameter("object_contact_vel_threshold").as_double();
-    settle_frames_                = get_parameter("settle_frames").as_int();
-    grasp_hold_sec_               = get_parameter("grasp_hold_sec").as_double();
+    contact_delta_threshold_  = get_parameter("contact_delta_threshold").as_double();
+    min_finger_triggers_      = get_parameter("min_finger_triggers").as_int();
+    grasp_reach_threshold_    = get_parameter("grasp_reach_threshold").as_double();
+    effort_contact_threshold_ = get_parameter("effort_contact_threshold").as_double();
+    min_effort_fingers_       = get_parameter("min_effort_fingers").as_int();
+    slip_threshold_           = get_parameter("slip_threshold").as_double();
+    snn_tau_slip_             = get_parameter("snn_tau_slip").as_double();
+    slip_target_increment_    = get_parameter("slip_target_increment").as_double();
+    slip_target_max_          = get_parameter("slip_target_max").as_double();
+    settle_frames_            = get_parameter("settle_frames").as_int();
+    grasp_hold_sec_           = get_parameter("grasp_hold_sec").as_double();
 
-    // ── SNN slip 뉴런 초기화 ─────────────────────────────────────────────────
     for (int f = 0; f < N_FIN; f++) {
         slip_neurons_[f].threshold = slip_threshold_;
         slip_neurons_[f].tau       = snn_tau_slip_;
         slip_neurons_[f].reset();
     }
 
-    fin_contacted_.fill(false);
-    fin_hold_mcp_.fill(0.0);
+    cur_effort_.fill(0.0);
     initGraspTarget();
 
-    // ── 구독 ─────────────────────────────────────────────────────────────────
     js_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         "/allegroHand_0/joint_states", 10,
         std::bind(&ReflexGraspNode::onJointState, this, std::placeholders::_1));
@@ -103,7 +120,6 @@ ReflexGraspNode::ReflexGraspNode(const rclcpp::NodeOptions & options)
         "/allegroHand_0/lib_cmd", 10,
         std::bind(&ReflexGraspNode::onLibCmd, this, std::placeholders::_1));
 
-    // ── 발행 ─────────────────────────────────────────────────────────────────
     lib_pub_  = create_publisher<std_msgs::msg::String>(
         "/allegroHand_0/lib_cmd", 1);
 
@@ -118,14 +134,12 @@ ReflexGraspNode::ReflexGraspNode(const rclcpp::NodeOptions & options)
 
     RCLCPP_INFO(get_logger(), "==============================================");
     RCLCPP_INFO(get_logger(), "  Neuromorphic Reflex Grasp Node             ");
-    RCLCPP_INFO(get_logger(), "  [접촉감지] Δθ > %.4f rad  min_fingers=%d",
+    RCLCPP_INFO(get_logger(), "  [접촉감지] Δθ>%.3f  min_fin=%d",
                 contact_delta_threshold_, min_finger_triggers_);
-    RCLCPP_INFO(get_logger(), "  [SNN slip] thr=%.4f  tau=%.3fs",
-                slip_threshold_, snn_tau_slip_);
-    RCLCPP_INFO(get_logger(), "  [slip보상] +%.3f rad/spike  max=%.2f rad",
-                slip_target_increment_, slip_target_max_);
-    RCLCPP_INFO(get_logger(), "  [속도]     %.2f rad/s  settle=%.1fs",
-                grasp_speed_, settle_frames_ / 100.0);
+    RCLCPP_INFO(get_logger(), "  [부하감지] effort>%.2f  min_fin=%d",
+                effort_contact_threshold_, min_effort_fingers_);
+    RCLCPP_INFO(get_logger(), "  [SNN slip] thr=%.4f  tau=%.3fs  incr=%.3f",
+                slip_threshold_, snn_tau_slip_, slip_target_increment_);
     RCLCPP_INFO(get_logger(), "==============================================");
 
     transitionTo(ReflexState::SETTLING);
@@ -145,13 +159,20 @@ void ReflexGraspNode::initGraspTarget()
 void ReflexGraspNode::onJointState(const sensor_msgs::msg::JointState & msg)
 {
     if (static_cast<int>(msg.position.size()) < DOF) return;
+
     prev_pos_ = cur_pos_;
     for (int i = 0; i < DOF; i++) cur_pos_[i] = msg.position[i];
+
+    // effort 저장
+    if (static_cast<int>(msg.effort.size()) >= DOF) {
+        for (int i = 0; i < DOF; i++) cur_effort_[i] = msg.effort[i];
+    }
+
     js_received_ = true;
 }
 
 // =============================================================================
-// onLibCmd  — 키보드 'r' 감지 (self-echo 방지)
+// onLibCmd
 // =============================================================================
 void ReflexGraspNode::onLibCmd(const std_msgs::msg::String & msg)
 {
@@ -165,39 +186,33 @@ void ReflexGraspNode::onLibCmd(const std_msgs::msg::String & msg)
 }
 
 // =============================================================================
-// onExtCmd  — 수동 명령
+// onExtCmd
 // =============================================================================
 void ReflexGraspNode::onExtCmd(const std_msgs::msg::String & msg)
 {
     const auto & cmd = msg.data;
-    RCLCPP_INFO(get_logger(), "수동 명령: [%s]", cmd.c_str());
-
     if      (cmd == "reset" || cmd == "ready") transitionTo(ReflexState::SETTLING);
-    else if (cmd == "grasp")  transitionTo(ReflexState::SLOW_GRASPING);
-    else if (cmd == "off") {
-        sendLibCmd("off");
-        transitionTo(ReflexState::IDLE);
-    }
+    else if (cmd == "grasp")  transitionTo(ReflexState::GRASPING);
+    else if (cmd == "off") { sendLibCmd("off"); transitionTo(ReflexState::IDLE); }
     else if (cmd == "status")
-        RCLCPP_INFO(get_logger(), "현재 상태: %s", stateName(state_).c_str());
-    else
-        RCLCPP_WARN(get_logger(), "알 수 없는 명령: %s", cmd.c_str());
+        RCLCPP_INFO(get_logger(), "상태: %s", stateName(state_).c_str());
 }
 
 // =============================================================================
-// timerCb (100 Hz)
+// timerCb (100Hz)
 // =============================================================================
 void ReflexGraspNode::timerCb()
 {
     if (!js_received_) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-                             "joint_states 수신 대기 중...");
+                             "joint_states 대기 중...");
         return;
     }
     switch (state_) {
-        case ReflexState::SETTLING:         tickSettling();   break;
-        case ReflexState::READY_MONITORING: tickMonitoring(); break;
-        case ReflexState::SLOW_GRASPING:    tickGrasping();   break;
+        case ReflexState::SETTLING:         tickSettling();        break;
+        case ReflexState::READY_MONITORING: tickMonitoring();      break;
+        case ReflexState::GRASPING:         tickGrasping();        break;
+        case ReflexState::SNN_STABILIZING:  tickSnnStabilizing();  break;
         case ReflexState::IDLE:             break;
     }
 }
@@ -220,178 +235,168 @@ void ReflexGraspNode::tickSettling()
 
 // =============================================================================
 // tickMonitoring
-//
-// SNN 없음 — 단순 Δθ 임계값 비교
-//   Σ|cur - ready| > contact_delta_threshold 인 손가락 수 카운트
-//   → min_finger_triggers 이상이면 grasp 트리거
+// 단순 Δθ 비교 → 물체 접촉 감지 → GRASPING
 // =============================================================================
 void ReflexGraspNode::tickMonitoring()
 {
     int triggered = 0;
-
     for (int f = 0; f < N_FIN; f++) {
         double delta = 0.0;
         for (int j = 0; j < 4; j++)
             delta += std::abs(cur_pos_[f*4+j] - ready_pos_[f*4+j]);
-
-        if (delta > contact_delta_threshold_)
-            triggered++;
+        if (delta > contact_delta_threshold_) triggered++;
     }
 
     publishDebug();
 
     if (triggered >= min_finger_triggers_) {
         RCLCPP_INFO(get_logger(),
-                    "★ 접촉 감지! %d개 손가락 Δθ 초과 → SLOW_GRASPING", triggered);
-        transitionTo(ReflexState::SLOW_GRASPING);
+                    "★ 접촉 감지! %d개 손가락 Δθ 초과 → GRASPING", triggered);
+        transitionTo(ReflexState::GRASPING);
     }
 }
 
 // =============================================================================
 // tickGrasping
-//
-// ① SNN slip 감지 (핵심)
-// ② 물체 크기 적응
-// ③ 보간 닫기
+// grasp_3 포즈 완료 대기
+// 현재각이 grasp_3 목표각에 충분히 가까워지면 → SNN_STABILIZING
 // =============================================================================
 void ReflexGraspNode::tickGrasping()
 {
-    // ① SNN slip 감지 — 물체 잡은 후 미끄러지면 target 증가
-    runSlipSNN();
+    publishDebug();
 
-    // ② 물체 크기 적응 — 속도 급감 손가락 홀드
-    detectObjectContact();
-
-    // ③ 보간 닫기
-    const double step = grasp_speed_ * DT;
-    bool all_done = true;
-
-    for (int f = 0; f < N_FIN; f++) {
-        int base = f * 4;
-
-        if (fin_contacted_[f]) {
-            // spread → target, MCP → 홀드, PIP·DIP → target
-            cmd_pos_[base + 0] = grasp_target_[base + 0];
-            cmd_pos_[base + 1] = fin_hold_mcp_[f];
-            cmd_pos_[base + 2] = grasp_target_[base + 2];
-            cmd_pos_[base + 3] = grasp_target_[base + 3];
-            continue;
-        }
-
-        for (int j = 0; j < 4; j++) {
-            int    idx  = base + j;
-            double diff = grasp_target_[idx] - cmd_pos_[idx];
-            if (std::abs(diff) > step) {
-                cmd_pos_[idx] += (diff > 0.0) ? step : -step;
-                all_done = false;
-            } else {
-                cmd_pos_[idx] = grasp_target_[idx];
-            }
-        }
+    if (isGraspReached()) {
+        RCLCPP_INFO(get_logger(),
+                    "★ grasp_3 포즈 완료 → SNN_STABILIZING");
+        transitionTo(ReflexState::SNN_STABILIZING);
     }
 
-    sendJointCmd();
-
-    if (all_done) {
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-                             "grasp 유지 중 | slip_events=%d",
-                             slip_event_count_);
+    // 타임아웃 (5초)
+    if ((now() - grasp_start_time_).seconds() > 5.0) {
+        RCLCPP_WARN(get_logger(), "grasp_3 타임아웃 → 강제 SNN_STABILIZING");
+        transitionTo(ReflexState::SNN_STABILIZING);
     }
+}
 
-    if (grasp_hold_sec_ > 0.0 &&
-        (now() - grasp_start_time_).seconds() > grasp_hold_sec_) {
-        RCLCPP_INFO(get_logger(), "grasp 유지 시간 초과 → SETTLING");
-        transitionTo(ReflexState::SETTLING);
+// =============================================================================
+// tickSnnStabilizing
+//
+// [동작 원리]
+//  1. effort 감시: 물체 부하가 실제로 걸려있는지 확인
+//     → effort_contact_threshold 이상인 손가락 수 >= min_effort_fingers
+//     → 부하 있음 → SNN slip 보정 동작
+//
+//  2. SNN slip 보정:
+//     slip = max(0, grasp_target_MCP - cur_MCP)
+//     → LIF 뉴런 적분 → spike
+//     → grasp_target += slip_target_increment
+//     → joint_cmd 로 더 깊은 목표각 전달
+//     → PD 토크 증가 → 더 세게 잡음
+// =============================================================================
+void ReflexGraspNode::tickSnnStabilizing()
+{
+    // 부하 감지
+    if (isEffortDetected()) {
+        runSlipSNN();
     }
 
     publishDebug();
+
+    // grasp_hold_sec 초과 시 리셋
+    if (grasp_hold_sec_ > 0.0 &&
+        (now() - grasp_start_time_).seconds() > grasp_hold_sec_) {
+        RCLCPP_INFO(get_logger(), "유지 시간 초과 → SETTLING");
+        transitionTo(ReflexState::SETTLING);
+    }
+}
+
+// =============================================================================
+// isGraspReached
+// 손가락 4개 중 3개 이상이 grasp_3 목표각 근처에 도달했으면 완료
+// =============================================================================
+bool ReflexGraspNode::isGraspReached() const
+{
+    int reached = 0;
+    for (int f = 0; f < N_FIN; f++) {
+        double err = 0.0;
+        for (int j = 0; j < 4; j++)
+            err += std::abs(cur_pos_[f*4+j] - GRASP3[f*4+j]);
+        if (err < grasp_reach_threshold_) reached++;
+    }
+    return reached >= 3;
+}
+
+// =============================================================================
+// isEffortDetected
+// MCP 관절 토크가 threshold 이상인 손가락 수 확인
+// =============================================================================
+bool ReflexGraspNode::isEffortDetected() const
+{
+    int count = 0;
+    for (int f = 0; f < N_FIN; f++) {
+        int mcp = f * 4 + 1;
+        if (std::abs(cur_effort_[mcp]) > effort_contact_threshold_) count++;
+    }
+    return count >= min_effort_fingers_;
 }
 
 // =============================================================================
 // runSlipSNN
 //
-// [논문 핵심] FeFET-PIM 기반 SNN slip reflex
+// [논문 연결] FeFET-PIM Crossbar SNN slip reflex
 //
-//   입력 전류 I = max(0, cmd_MCP - cur_MCP)
-//     → cmd_MCP : 지금 보내고 있는 목표 MCP 각도
-//     → cur_MCP : 실제 측정된 MCP 각도
-//     → 차이가 양수 = 물체가 손가락을 밀어내고 있음 = slip
-//
-//   LIF 뉴런이 이 값을 시간 적분
-//     → 일시적 오차는 무시 (노이즈 필터 역할)
-//     → 지속적 slip 이면 막전위 누적 → threshold 초과 → spike
-//
-//   spike 발생 시:
-//     ① grasp_target[MCP/PIP/DIP] += slip_target_increment
-//        (더 깊은 목표각 → PD 위치 오차 증가 → PD 토크 자연히 증가)
-//     ② fin_contacted 리셋
-//        (홀드 해제 → 새 목표각으로 보간 닫기 재시작)
-//
-//   결과: 물체 무게/마찰/크기에 관계없이 slip 이 멈출 때까지 자동 적응
+//  입력 전류 I = max(0, grasp_target_MCP - cur_MCP)
+//    → grasp_3 목표각보다 실제 관절이 열려있는 정도 = slip 정도
+//  LIF 뉴런 적분 → threshold 초과 → spike
+//  spike 시:
+//    ① grasp_target MCP/PIP/DIP += slip_target_increment (방향 고려)
+//    ② joint_cmd 발행 → PD 토크 증가 → 더 세게 잡음
 // =============================================================================
 void ReflexGraspNode::runSlipSNN()
 {
+    bool any_spike = false;
+
     for (int f = 0; f < N_FIN; f++) {
         int    mcp  = f * 4 + 1;
-
-        // slip 입력: 목표보다 실제가 열려있는 정도
-        double slip = std::max(0.0, cmd_pos_[mcp] - cur_pos_[mcp]);
+        double slip = std::max(0.0, grasp_target_[mcp] - cur_pos_[mcp]);
 
         if (slip_neurons_[f].update(slip, DT)) {
             slip_event_count_++;
+            any_spike = true;
 
             RCLCPP_WARN(get_logger(),
                         "★ Slip SNN spike! finger%d  slip=%.4f rad  "
-                        "→ target +%.3f rad  (총 events=%d)",
+                        "→ target +%.3f  (events=%d)",
                         f, slip, slip_target_increment_, slip_event_count_);
 
-            // ① MCP, PIP, DIP 목표각 증가 (spread 는 유지)
+            // 방향 고려해서 목표각 증가
             for (int j = 1; j < 4; j++) {
-                int idx = f * 4 + j;
-                grasp_target_[idx] = std::min(
-                    grasp_target_[idx] + slip_target_increment_,
-                    slip_target_max_
-                );
+                int    idx = f * 4 + j;
+                double dir = SLIP_DIR[f][j];
+                double lim = SLIP_LIMIT[f][j];
+
+                if (dir > 0.0) {
+                    grasp_target_[idx] = std::min(
+                        grasp_target_[idx] + slip_target_increment_, lim);
+                } else {
+                    grasp_target_[idx] = std::max(
+                        grasp_target_[idx] - slip_target_increment_, lim);
+                }
             }
 
-            // ② 홀드 해제 → 새 목표각으로 보간 닫기 재시작
-            fin_contacted_[f] = false;
-
             RCLCPP_INFO(get_logger(),
-                        "  finger%d new target → MCP=%.3f  PIP=%.3f  DIP=%.3f",
+                        "  finger%d new target → MCP=%.3f PIP=%.3f DIP=%.3f",
                         f,
                         grasp_target_[f*4+1],
                         grasp_target_[f*4+2],
                         grasp_target_[f*4+3]);
         }
     }
-}
 
-// =============================================================================
-// detectObjectContact
-//
-// cmd 는 계속 증가하는데 실제 관절 속도 급감
-// → 물체 저항 → 해당 손가락 MCP 홀드
-// =============================================================================
-void ReflexGraspNode::detectObjectContact()
-{
-    for (int f = 0; f < N_FIN; f++) {
-        if (fin_contacted_[f]) continue;
-
-        int    mcp       = f * 4 + 1;
-        double remaining = std::abs(grasp_target_[mcp] - cmd_pos_[mcp]);
-        bool   cmd_moving = remaining > 0.01;
-
-        double actual_vel = std::abs(cur_pos_[mcp] - prev_pos_[mcp]) / DT;
-        bool   hand_stuck = actual_vel < object_contact_vel_threshold_;
-
-        if (cmd_moving && hand_stuck) {
-            fin_contacted_[f] = true;
-            fin_hold_mcp_[f]  = cur_pos_[mcp];
-            RCLCPP_INFO(get_logger(),
-                        "★ 물체 접촉: finger%d  MCP=%.3f rad 홀드",
-                        f, fin_hold_mcp_[f]);
-        }
+    // spike 발생 시 새 목표각으로 joint_cmd 발행
+    if (any_spike) {
+        cmd_pos_ = grasp_target_;
+        sendJointCmd();
     }
 }
 
@@ -411,32 +416,41 @@ void ReflexGraspNode::transitionTo(ReflexState next)
         sendLibCmd("ready");
         frame_count_      = 0;
         slip_event_count_ = 0;
-        fin_contacted_.fill(false);
         for (int f = 0; f < N_FIN; f++) slip_neurons_[f].reset();
-        initGraspTarget();   // slip 으로 증가된 target 초기화
+        initGraspTarget();
         RCLCPP_INFO(get_logger(), "ready 발행 → %.1fs 안정화 대기",
                     settle_frames_ / 100.0);
         break;
 
     case ReflexState::READY_MONITORING:
-        ready_pos_ = cur_pos_;   // 현재각을 기준각으로 저장
+        ready_pos_ = cur_pos_;
         RCLCPP_INFO(get_logger(), "────────────────────────────────────────");
         RCLCPP_INFO(get_logger(), "★ 기준각 저장 완료                       ★");
         RCLCPP_INFO(get_logger(), "★ 물체를 손가락에 살짝 갖다 대세요       ★");
-        RCLCPP_INFO(get_logger(), "  Δθ > %.4f rad 감지 시 grasp 시작",
+        RCLCPP_INFO(get_logger(), "  Δθ > %.3f rad 감지 시 grasp_3 시작",
                     contact_delta_threshold_);
         RCLCPP_INFO(get_logger(), "────────────────────────────────────────");
         break;
 
-    case ReflexState::SLOW_GRASPING:
+    case ReflexState::GRASPING:
+        // BHand 내장 grasp_3 동작 직접 호출
+        sendLibCmd("grasp_3");
+        grasp_start_time_ = now();
+        RCLCPP_INFO(get_logger(), "★★★ grasp_3 시작! ★★★");
+        RCLCPP_INFO(get_logger(), "  포즈 완료 대기 중...");
+        break;
+
+    case ReflexState::SNN_STABILIZING:
+        // pdControl 전환 후 joint_cmd 로 slip 보정
         sendLibCmd("pdControl");
-        cmd_pos_ = cur_pos_;     // 현재 위치에서 부드럽게 시작
-        fin_contacted_.fill(false);
+        cmd_pos_ = cur_pos_;
         for (int f = 0; f < N_FIN; f++) slip_neurons_[f].reset();
         grasp_start_time_ = now();
-        RCLCPP_INFO(get_logger(), "★★★ grasp 시작! ★★★");
-        RCLCPP_INFO(get_logger(), "  %.2f rad/s 로 천천히 닫는 중...", grasp_speed_);
-        RCLCPP_INFO(get_logger(), "  물체 잡으면 홀드 → slip 시 SNN 발화 → 더 세게");
+        RCLCPP_INFO(get_logger(), "────────────────────────────────────────");
+        RCLCPP_INFO(get_logger(), "★ SNN slip 보정 시작                     ★");
+        RCLCPP_INFO(get_logger(), "  effort > %.2f 감지 시 SNN 동작",
+                    effort_contact_threshold_);
+        RCLCPP_INFO(get_logger(), "────────────────────────────────────────");
         break;
 
     case ReflexState::IDLE:
@@ -450,9 +464,8 @@ void ReflexGraspNode::transitionTo(ReflexState next)
 // =============================================================================
 bool ReflexGraspNode::isStable() const
 {
-    for (int i = 0; i < DOF; i++) {
+    for (int i = 0; i < DOF; i++)
         if (std::abs(cur_pos_[i] - prev_pos_[i]) > 0.003) return false;
-    }
     return true;
 }
 
@@ -474,28 +487,23 @@ void ReflexGraspNode::sendJointCmd()
 }
 
 // /contact_trigger/debug 레이아웃:
-//  [0~3]  손가락별 Σ|Δθ|          (접촉 감지 입력값, threshold=0.05)
-//  [4~7]  slip 뉴런 막전위         (이 값이 threshold 넘으면 spike)
-//  [8~11] 손가락별 현재 grasp_target MCP  (slip 으로 증가하는 값)
+//  [0~3]  손가락별 Σ|Δθ|        (접촉 감지값, threshold=0.05)
+//  [4~7]  손가락별 MCP effort    (부하 감지값)
+//  [8~11] slip 뉴런 막전위       (threshold 넘으면 spike)
 //  [12]   slip_event_count_
-//  [13]   현재 상태 (0=IDLE 1=SETTLING 2=MONITORING 3=GRASPING)
+//  [13]   현재 상태 (0~4)
 void ReflexGraspNode::publishDebug()
 {
     std_msgs::msg::Float64MultiArray msg;
     msg.data.resize(14);
 
     for (int f = 0; f < N_FIN; f++) {
-        // Σ|Δθ| (접촉 감지 입력)
         double delta = 0.0;
         for (int j = 0; j < 4; j++)
             delta += std::abs(cur_pos_[f*4+j] - ready_pos_[f*4+j]);
         msg.data[f]   = delta;
-
-        // slip 뉴런 막전위
-        msg.data[f+4] = slip_neurons_[f].membrane;
-
-        // 현재 grasp_target MCP (slip 으로 증가 추적)
-        msg.data[f+8] = grasp_target_[f*4+1];
+        msg.data[f+4] = cur_effort_[f*4+1];   // MCP effort
+        msg.data[f+8] = slip_neurons_[f].membrane;
     }
     msg.data[12] = static_cast<double>(slip_event_count_);
     msg.data[13] = static_cast<double>(state_);
@@ -509,7 +517,8 @@ std::string ReflexGraspNode::stateName(ReflexState s) const
         case ReflexState::IDLE:             return "IDLE";
         case ReflexState::SETTLING:         return "SETTLING";
         case ReflexState::READY_MONITORING: return "READY_MONITORING";
-        case ReflexState::SLOW_GRASPING:    return "SLOW_GRASPING";
+        case ReflexState::GRASPING:         return "GRASPING";
+        case ReflexState::SNN_STABILIZING:  return "SNN_STABILIZING";
         default:                            return "UNKNOWN";
     }
 }
