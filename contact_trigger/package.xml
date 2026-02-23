@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>contact_trigger</name>
+  <version>0.1.0</version>
+  <description>
+    무촉각 고유감각 기반 반사 그립 트리거 노드.
+    allegro_hand_controllers 와 ROS2 토픽으로만 통신한다.
+    /allegroHand/joint_states 구독 → 관절각 오차 임계치 비교 → /allegroHand/lib_cmd 발행
+  </description>
+
+  <maintainer email="you@example.com">your_name</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
