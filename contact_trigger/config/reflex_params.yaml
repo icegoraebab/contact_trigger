@@ -4,7 +4,7 @@ reflex_grasp_node:
     # ── SNN 접촉 감지 ─────────────────────────────────────────────────────────
     # V_ss = Σ|Δθ| × tau  (5° 움직임 → 0.35rad × 0.05 = 0.0175)
     # threshold < V_ss 이어야 발화 가능
-    contact_threshold:   0.005   # ~0.3초 누적 후 발화
+    contact_threshold:   0.007   # ~0.3초 누적 후 발화, 터치 민감도 조절
     snn_tau_contact:     0.05
     min_finger_triggers: 1
 
