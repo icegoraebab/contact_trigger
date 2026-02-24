@@ -1,27 +1,29 @@
 reflex_grasp_node:
   ros__parameters:
 
-    # ── 접촉 감지 ────────────────────────────────────────────────────────────
-    contact_delta_threshold: 0.05    # ready 대비 Δθ 합산 [rad]
+    # ── SNN 접촉 감지 ─────────────────────────────────────────────────────────
+    # V_ss = Σ|Δθ| × tau  (5° 움직임 → 0.35rad × 0.05 = 0.0175)
+    # threshold < V_ss 이어야 발화 가능
+    contact_threshold:   0.005   # ~0.3초 누적 후 발화
+    snn_tau_contact:     0.05
     min_finger_triggers: 1
 
-    # ── grasp_3 완료 판정 ────────────────────────────────────────────────────
-    # grasp_3 목표각 대비 현재각 오차가 이 값 이하면 완료로 판정
-    grasp_reach_threshold: 0.15      # [rad]
+    # ── SNN slip 감지 ─────────────────────────────────────────────────────────
+    snn_tau_slip:   0.03
+    slip_threshold: 0.001
 
-    # ── 부하(토크) 감지 ──────────────────────────────────────────────────────
-    # effort 절댓값이 이 값 이상이면 물체 접촉(부하) 판정
-    effort_contact_threshold: 0.3    # [Nm]
-    min_effort_fingers: 1            # 몇 개 손가락 이상 부하 감지 시 SNN 시작
+    # ── envelop torque 적응 제어 ──────────────────────────────────────────────
+    #
+    # 동작 원리:
+    #   slip 발생  → torque += torque_step_up   (즉시 조금 올림)
+    #   slip 없음  → torque *= torque_decay_rate (서서히 내림)
+    #   → slip이 막 멈추는 최소 토크로 자동 수렴
+    #
+    torque_min:         0.3    # 최소 토크 (grasp_3 기본 시작값)
+    torque_max:         0.7    # 최대 토크 (손/물체 보호 상한)
+    torque_step_up:     0.03   # slip 1회당 +3% 증가
+    torque_decay_rate:  0.995  # slip 없으면 매 tick 0.5% 감소
 
-    # ── SNN Slip 감지 ────────────────────────────────────────────────────────
-    slip_threshold:        0.001
-    snn_tau_slip:          0.03
-
-    # ── Slip 보상 ────────────────────────────────────────────────────────────
-    slip_target_increment: 0.05      # spike 시 목표각 증가량 [rad]
-    slip_target_max:       1.57      # 목표각 상한 [rad]
-
-    # ── 안정화 ───────────────────────────────────────────────────────────────
-    settle_frames: 400
-    grasp_hold_sec: 0.0
+    # ── 기타 ─────────────────────────────────────────────────────────────────
+    settle_frames:  300     # 100Hz × 3s
+    grasp_hold_sec: 0.0     # 0 = 무한 유지
