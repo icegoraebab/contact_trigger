@@ -202,8 +202,9 @@ void ReflexGraspNode::tickGrasping()
 
     // ③ slip SNN
     if (runSlipSNN()) {
-        // spread(j=0) 는 건드리지 않음, 굽힘(j=1~3) 만 더 닫기
-        for (int f = 0; f < 3; f++) {
+        // finger0, finger1 굽힘(j=1~3) 만 더 닫기
+        // finger2(ring) 는 grasp_3 미사용 → 건드리지 않음
+        for (int f = 0; f < 2; f++) {
             for (int j = 1; j <= 3; j++) {
                 grasp_target_[f*4+j] = std::min(
                     grasp_target_[f*4+j] + slip_push_, 1.80);
@@ -376,9 +377,12 @@ void ReflexGraspNode::transitionTo(ReflexState next)
         // joint_cmd 보내는 순간 allegro_node_grasp 가 자동으로 PD 모드 전환
         // → pdControl 명령 불필요
         cmd_position_ = current_position_;
-        // spread 관절(j=0)은 ready 포즈값 고정 (옆으로 안 쏠림)
+        // spread(j=0): finger0~2 ready 포즈값 고정 (옆으로 안 쏠림)
         for (int f = 0; f < 3; f++)
             grasp_target_[f*4] = ready_position_[f*4];
+        // finger2(ring): grasp_3 에서 안 쓰임 → 굽힘 관절 전체 ready 고정
+        for (int j = 1; j <= 3; j++)
+            grasp_target_[2*4+j] = ready_position_[2*4+j];
         for (int f = 0; f < N_FIN; f++) slip_neurons_[f].reset();
         grasp_start_time_ = this->now();
         RCLCPP_INFO(this->get_logger(),
