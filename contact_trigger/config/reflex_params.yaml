@@ -2,9 +2,8 @@ reflex_grasp_node:
   ros__parameters:
 
     # ── SNN 접촉 감지 ─────────────────────────────────────────────────────────
-    # V_ss = Σ|Δθ| × tau  (5° 움직임 → 0.35rad × 0.05 = 0.0175)
-    # threshold < V_ss 이어야 발화 가능
-    contact_threshold:   0.007   # ~0.3초 누적 후 발화, 터치 민감도 조절
+    # 낮을수록 민감 / 높을수록 둔감
+    contact_threshold:   0.012
     snn_tau_contact:     0.05
     min_finger_triggers: 1
 
@@ -12,18 +11,15 @@ reflex_grasp_node:
     snn_tau_slip:   0.03
     slip_threshold: 0.001
 
-    # ── envelop torque 적응 제어 ──────────────────────────────────────────────
-    #
-    # 동작 원리:
-    #   slip 발생  → torque += torque_step_up   (즉시 조금 올림)
-    #   slip 없음  → torque *= torque_decay_rate (서서히 내림)
-    #   → slip이 막 멈추는 최소 토크로 자동 수렴
-    #
-    torque_min:         0.3    # 최소 토크 (grasp_3 기본 시작값)
-    torque_max:         0.7    # 최대 토크 (손/물체 보호 상한)
-    torque_step_up:     0.03   # slip 1회당 +3% 증가
-    torque_decay_rate:  0.995  # slip 없으면 매 tick 0.5% 감소
+    # ── 천천히 닫기 ───────────────────────────────────────────────────────────
+    # 0.05=매우느림(14s) / 0.10=느림(7s) / 0.20=기본(3.5s) / 0.50=빠름(1.4s)
+    grasp_speed: 0.20
+
+    # ── slip 대응 ─────────────────────────────────────────────────────────────
+    # slip spike 1회당 목표 관절각 추가로 닫는 양 [rad]
+    # 크면 빠르게 수렴, 작으면 천천히 수렴
+    slip_push: 0.02
 
     # ── 기타 ─────────────────────────────────────────────────────────────────
-    settle_frames:  300     # 100Hz × 3s
-    grasp_hold_sec: 0.0     # 0 = 무한 유지
+    settle_frames:  300
+    grasp_hold_sec: 0.0
